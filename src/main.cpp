@@ -2,42 +2,43 @@
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
+#include <arduinoFFT.h>
 
 #define SAMPLE_RATE 2000
 #define SAMPLES 1024
+#define SERIAL_BAUD 921600 
 
-float vRealX[SAMPLES];
-float vImagX[SAMPLES];
-float vRealY[SAMPLES];
-float vImagY[SAMPLES];
-float vRealZ[SAMPLES];
-float vImagZ[SAMPLES];
+float vRealX[SAMPLES], vImagX[SAMPLES];
+float vRealY[SAMPLES], vImagY[SAMPLES];
+float vRealZ[SAMPLES], vImagZ[SAMPLES];
+
+// Time-domain backup arrays
+float timeX[SAMPLES], timeY[SAMPLES], timeZ[SAMPLES];
+
+ArduinoFFT<float> FFT_X = ArduinoFFT<float>(vRealX, vImagX, SAMPLES, SAMPLE_RATE);
+ArduinoFFT<float> FFT_Y = ArduinoFFT<float>(vRealY, vImagY, SAMPLES, SAMPLE_RATE);
+ArduinoFFT<float> FFT_Z = ArduinoFFT<float>(vRealZ, vImagZ, SAMPLES, SAMPLE_RATE);
 
 const int sampleTime = round(1000000 * (1.0 / SAMPLE_RATE)); // Sample time in microseconds
 
 Adafruit_MPU6050 mpu;
 
-float accX, accY, accZ;
-float gyroX, gyroY, gyroZ;
-
-void getData(void);
-void samplingWindow(void);
-void displayData(void);
+void collectSamples(float *meanX, float *meanY, float *meanZ);
+void streamData(void);
+void executeFFT(float meanX, float meanY, float meanZ);
 
 void setup(void) {
-  Serial.begin(9600);
+  Serial.begin(SERIAL_BAUD);
   delay(500); 
   Serial.println("\n=== System Initializing ===");
 
   if (!mpu.begin()) {
     Serial.println("Failed to find MPU6050 chip");
-    while (1) {
-      delay(10);
-    }
+    while (1) { delay(10); }
   }
   Serial.println("MPU6050 Found!");
 
-  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G); 
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_260_HZ);
 
@@ -45,46 +46,77 @@ void setup(void) {
 }
 
 void loop() {
-  samplingWindow();
-  displayData();
-  delay(1000);
+  float meanX=0, meanY=0, meanZ=0;
+  collectSamples(&meanX, &meanY, &meanZ);
+  executeFFT(meanX, meanY, meanZ);
+  streamData();
+  delay(30); 
 }
 
-
-void getData(void) {
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp); 
-  accX = a.acceleration.x;
-  accY = a.acceleration.y;
-  accZ = a.acceleration.z;
-  gyroX = g.gyro.x;
-  gyroY = g.gyro.y;
-  gyroZ = g.gyro.z;
-}
-
-void samplingWindow(void){
-  unsigned long prevTime=micros(); 
-  int i=0;
-  while(i<SAMPLES){
+void collectSamples(float *meanX, float *meanY, float *meanZ){
+  sensors_event_t a, g, temp; 
+  float sumX = 0, sumY = 0, sumZ = 0;
+  unsigned long prevTime = micros(); 
+  int i = 0;
+  
+  while(i < SAMPLES){
     unsigned long startTime = micros();
-    if((startTime-prevTime)>=sampleTime){
-      getData();
-      vRealX[i] = accX;
-      vImagX[i] = 0;
-      vRealY[i] = accY;
-      vImagY[i] = 0;
-      vRealZ[i] = accZ;
-      vImagZ[i] = 0;
-      prevTime=startTime; 
+    if((startTime - prevTime) >= sampleTime){
+    
+      mpu.getEvent(&a, &g, &temp); 
+  
+      timeX[i] = a.acceleration.x;
+      timeY[i] = a.acceleration.y;
+      timeZ[i] = a.acceleration.z;
+
+      vRealX[i] = a.acceleration.x; vImagX[i] = 0;
+      vRealY[i] = a.acceleration.y; vImagY[i] = 0;
+      vRealZ[i] = a.acceleration.z; vImagZ[i] = 0;
+
+      sumX += vRealX[i]; sumY += vRealY[i]; sumZ += vRealZ[i];
+      
+      prevTime = startTime; 
       i++;
     }
     yield();
   }
- }
+  *meanX = sumX / SAMPLES;
+  *meanY = sumY / SAMPLES;
+  *meanZ = sumZ / SAMPLES;
+}
 
- void displayData(void){
-for(int i = 0; i < SAMPLES; i++) {
-    Serial.printf("Sample [%d] -> X: %.2f | Y: %.2f | Z: %.2f\n", i, vRealX[i], vRealY[i], vRealZ[i]);
-    delay(500);
-  } 
+void executeFFT(float meanX, float meanY, float meanZ){
+  for(int i = 0; i < SAMPLES; i++) {
+    vRealX[i] -= meanX; vRealY[i] -= meanY; vRealZ[i] -= meanZ;
+  }
+
+  FFT_X.windowing(FFTWindow::Hamming, FFTDirection::Forward); 
+  FFT_Y.windowing(FFTWindow::Hamming, FFTDirection::Forward); 
+  FFT_Z.windowing(FFTWindow::Hamming, FFTDirection::Forward); 
+
+  FFT_X.compute(FFTDirection::Forward);
+  FFT_Y.compute(FFTDirection::Forward);
+  FFT_Z.compute(FFTDirection::Forward);
+
+  FFT_X.complexToMagnitude();
+  FFT_Y.complexToMagnitude();
+  FFT_Z.complexToMagnitude();
+}
+
+
+void streamData(void) {
+  for (int i = 0; i < SAMPLES; i++) { Serial.print(timeX[i], 1); if (i < SAMPLES - 1) Serial.print(","); }
+  Serial.print(";");
+  for (int i = 0; i < SAMPLES; i++) { Serial.print(timeY[i], 1); if (i < SAMPLES - 1) Serial.print(","); }
+  Serial.print(";");
+  for (int i = 0; i < SAMPLES; i++) { Serial.print(timeZ[i], 1); if (i < SAMPLES - 1) Serial.print(","); }
+
+  Serial.print("|"); 
+
+  for (int i = 0; i < 512; i++) { Serial.print(vRealX[i], 1); if (i < 511) Serial.print(","); }
+  Serial.print(";");
+  for (int i = 0; i < 512; i++) { Serial.print(vRealY[i], 1); if (i < 511) Serial.print(","); }
+  Serial.print(";");
+  for (int i = 0; i < 512; i++) { Serial.print(vRealZ[i], 1); if (i < 511) Serial.print(","); }
+  Serial.println(); 
 }
